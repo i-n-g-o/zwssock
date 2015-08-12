@@ -56,12 +56,35 @@ void zwssock_destroy(zwssock_t **self_p)
 int zwssock_bind(zwssock_t *self, char *endpoint)
 {
 	assert(self);
-	return zstr_sendx(self->control, "BIND", endpoint, NULL);
+	int result = zstr_sendx(self->control, "BIND", endpoint, NULL);
+	
+	// wait for result from worker thread
+	if (result >= 0) {
+		char * port = zstr_recv(self->control);
+		result = atoi(port);
+	}
+	return result;
 }
+
+int zwssock_unbind(zwssock_t *self, char *endpoint)
+{
+	assert(self);
+	int result = zstr_sendx(self->control, "UNBIND", endpoint, NULL);
+	
+	// wait for result from worker thread
+	if (result >= 0) {
+		char * unbindResult = zstr_recv(self->control);
+		result = atoi(unbindResult);
+	}
+	return result;
+}
+
 
 int zwssock_send(zwssock_t *self, zmsg_t **msg_p)
 {
+	// really?
 	assert(self);
+	// really?
 	assert(zmsg_size(*msg_p) > 0);
 	zmsg_send(msg_p, self->data);
 	return 0;
@@ -80,6 +103,13 @@ void* zwssock_handle(zwssock_t *self)
 	return self->data;
 }
 
+int zwssock_signal(zwssock_t *self)
+{
+	assert(self);
+	int result = zsocket_signal(self->data);
+	return result;
+}
+
 
 //  *************************    BACK END AGENT    *************************
 
@@ -89,7 +119,8 @@ typedef struct {
 	void *data;                 //  Data socket to application
 	void *stream;               //  stream socket to server		
 	zhash_t *clients;           //  Clients known so far
-	bool terminated;            //  Agent terminated by API	
+	bool terminated;            //  Agent terminated by API
+	int status;					//	last status
 } agent_t;
 
 static agent_t *
@@ -145,6 +176,10 @@ client_new(agent_t *agent, zframe_t *address)
 {
 	client_t *self = (client_t *)zmalloc(sizeof(client_t));
 	assert(self);
+	
+//	printf("client_new: %p\n", self);
+//	fflush(stdout);
+	
 	self->agent = agent;
 	self->address = zframe_dup(address);
 	self->hashkey = zframe_strhex(address);
@@ -157,11 +192,14 @@ client_new(agent_t *agent, zframe_t *address)
 static void
 client_destroy(client_t **self_p)
 {
+//	printf("client_destroy: %p\n", *self_p);
+//	fflush(stdout);
+	
 	assert(self_p);
 	if (*self_p) {
 		client_t *self = *self_p;
 		zframe_destroy(&self->address);
-
+		
 		if (self->decoder != NULL)
 		{
 			zwsdecoder_destroy(&self->decoder);
@@ -175,6 +213,7 @@ client_destroy(client_t **self_p)
 		free(self->hashkey);
 		free(self);
 		*self_p = NULL;
+
 	}
 }
 
@@ -200,17 +239,26 @@ void router_message_received(void *tag, byte* payload, int length, bool more)
 
 void close_received(void *tag, byte* payload, int length)
 {
-	// TODO: close received	
+	// remove client from hastable
+	client_t *client = (client_t *)tag;
+	
+	client->state = closed;
+	
+//	zhash_delete(client->agent->clients, client->hashkey);
+	
+	
+	
+	// TODO: close received
 }
 
 void ping_received(void *tag, byte* payload, int length)
 {
-	// TODO: implement ping 	
+	// TODO: implement ping
 }
 
 void pong_received(void *tag, byte* payload, int length)
 {
-	// TOOD: implement pong	
+	// TOOD: implement pong
 }
 
 static void client_data_ready(client_t * self)
@@ -279,6 +327,7 @@ client_free(void *argument)
 static int
 s_agent_handle_control(agent_t *self)
 {
+	int result = 0;
 	//  Get the whole message off the control socket in one go
 	zmsg_t *request = zmsg_recv(self->control);
 	char *command = zmsg_popstr(request);
@@ -288,23 +337,35 @@ s_agent_handle_control(agent_t *self)
 	if (streq(command, "BIND")) {
 		char *endpoint = zmsg_popstr(request);
 		puts(endpoint);
-		int rc = zsocket_bind(self->stream, "%s", endpoint);
-		assert(rc != -1);
+		result = zsocket_bind(self->stream, "%s", endpoint);
+		// really?
+		//assert(result != -1);
 		free(endpoint);
+		
+		// send result back
+		char p[6];
+		sprintf(p, "%d", result);
+		result = zstr_send(self->control, p);
 	}
 	else if (streq(command, "UNBIND")) {
 		char *endpoint = zmsg_popstr(request);
-		int rc = zsocket_unbind(self->stream, "%s", endpoint);
-		assert(rc != -1);
+		result = zsocket_unbind(self->stream, "%s", endpoint);
+		// really?
+		//assert(result != -1);
 		free(endpoint);
+		
+		// send result back
+		char p[6];
+		sprintf(p, "%d", result);
+		result = zstr_send(self->control, p);
 	}
 	else if (streq(command, "TERMINATE")) {
 		self->terminated = true;
-		zstr_send(self->control, "OK");
+		result = zstr_send(self->control, "OK");
 	}
 	free(command);
 	zmsg_destroy(&request);
-	return 0;
+	return result;
 }
 
 //  Handle a message from the server
@@ -327,10 +388,108 @@ s_agent_handle_router(agent_t *self)
 	client_data_ready(client);
 
 	//  If client is misbehaving, remove it
-	if (client->state == exception)
+	if (client->state == exception) {
 		zhash_delete(self->clients, client->hashkey);
+	}
 
 	return 0;
+}
+
+
+static int
+send_data_to_client(client_t *client, zmsg_t *request)
+{
+	int result = 0;
+	zframe_t* address;
+	agent_t *self = client->agent;
+	
+	//  Each frame is a full ZMQ message with identity frame
+	while (zmsg_size(request)) {
+		zframe_t *receivedFrame = zmsg_pop(request);
+		bool more = false;
+		
+		if (zmsg_size(request))
+			more = true;
+		
+		int frameSize = 2 + 1 + zframe_size(receivedFrame);
+		int payloadStartIndex = 2;
+		int payloadLength = zframe_size(receivedFrame) + 1;
+		
+		if (payloadLength > 125)
+		{
+			frameSize += 2;
+			payloadStartIndex += 2;
+			
+			if (payloadLength > 0xFFFF) // 2 bytes max value
+			{
+				frameSize += 6;
+				payloadStartIndex += 6;
+			}
+		}
+		
+		byte* outgoingData = (byte*)zmalloc(frameSize);
+		
+		outgoingData[0] = (byte)0x82; // Binary and Final
+		
+		// No mask
+		outgoingData[1] = 0x00;
+		
+		if (payloadLength <= 125)
+		{
+			outgoingData[1] |= (byte)(payloadLength & 127);
+		}
+		else if (payloadLength <= 0xFFFF) // maximum size of short
+		{
+			outgoingData[1] |= 126;
+			outgoingData[2] = (payloadLength >> 8) & 0xFF;
+			outgoingData[3] = payloadLength & 0xFF;
+		}
+		else
+		{
+			outgoingData[1] |= 127;
+			outgoingData[2] = 0;
+			outgoingData[3] = 0;
+			outgoingData[4] = 0;
+			outgoingData[5] = 0;
+			outgoingData[6] = (payloadLength >> 24) & 0xFF;
+			outgoingData[7] = (payloadLength >> 16) & 0xFF;
+			outgoingData[8] = (payloadLength >> 8) & 0xFF;
+			outgoingData[9] = payloadLength & 0xFF;
+		}
+		
+		// more byte
+		outgoingData[payloadStartIndex] = (byte)(more ? 1 : 0);
+		payloadStartIndex++;
+		
+		// payload
+		memcpy(outgoingData + payloadStartIndex, zframe_data(receivedFrame), zframe_size(receivedFrame));
+		
+		address = zframe_dup(client->address);
+		
+		result = zframe_send(&address, self->stream, ZFRAME_MORE);
+		if (result == 0) {
+			// success, send more
+			// send data
+			result = zsocket_sendmem(self->stream, outgoingData, frameSize, 0);
+			if (result != 0) {
+				// error
+				printf("error sending data\n");
+				fflush(stdout);
+			}
+		} else {
+			// error
+			printf("error sending address\n");
+			fflush(stdout);
+		}
+		
+		
+		free(outgoingData);
+		zframe_destroy(&receivedFrame);
+		
+		// TODO: check return code, on return code different than 0 or again set exception
+	}
+	
+	return result;
 }
 
 static int
@@ -343,81 +502,48 @@ s_agent_handle_data(agent_t *self)
 	char *hashkey = zmsg_popstr(request);
 	client_t *client = zhash_lookup(self->clients, hashkey);
 
-	zframe_t* address;
-
 	if (client) {		
-		//  Each frame is a full ZMQ message with identity frame
-		while (zmsg_size(request)) {
-			zframe_t *receivedFrame = zmsg_pop(request);
-			bool more = false;
+		
+		send_data_to_client(client, request);
 
-			if (zmsg_size(request))
-				more = true;
-
-			int frameSize = 2 + 1 + zframe_size(receivedFrame);
-			int payloadStartIndex = 2;
-			int payloadLength = zframe_size(receivedFrame) + 1;
-
-			if (payloadLength > 125)
-			{
-				frameSize += 2;
-				payloadStartIndex += 2;
-
-				if (payloadLength > 0xFFFF) // 2 bytes max value
-				{
-					frameSize += 6;
-					payloadStartIndex += 6;
+	} else if ( (strcmp("-1", hashkey) == 0) ||
+			   (strcmp("all", hashkey) == 0)) {
+		
+		// send to all clients
+		zlist_t * keys = zhash_keys(self->clients);
+		void * key = zlist_first(keys);
+		
+		while (key != NULL) {
+			client_t *client = zhash_lookup(self->clients, (char*)key);
+			if (client) {
+				
+				// send to connected clients
+				if (client->state == connected) {
+					zmsg_t * request_dup = zmsg_dup(request);
+					int result = send_data_to_client(client, request_dup);
+					if (result != 0) {
+						// error sending, remove from list...?
+						zhash_delete(self->clients, (char*)key);
+					}
+				} else {
+					// remove from list
+					zhash_delete(self->clients, (char*)key);
 				}
+				
+				// TODO: check return code
+			} else {
+				printf("no client for id: %s\n", (char*)key);
+				fflush(stdout);
 			}
-
-			byte* outgoingData = (byte*)zmalloc(frameSize);
 			
-			outgoingData[0] = (byte)0x82; // Binary and Final      
-
-			// No mask
-			outgoingData[1] = 0x00;
-
-			if (payloadLength <= 125)
-			{
-				outgoingData[1] |= (byte)(payloadLength & 127);
-			}
-			else if (payloadLength <= 0xFFFF) // maximum size of short
-			{
-				outgoingData[1] |= 126;
-				outgoingData[2] = (payloadLength >> 8) & 0xFF;
-				outgoingData[3] = payloadLength & 0xFF;
-			}
-			else
-			{
-				outgoingData[1] |= 127;
-				outgoingData[2] = 0;
-				outgoingData[3] = 0;
-				outgoingData[4] = 0;
-				outgoingData[5] = 0;
-				outgoingData[6] = (payloadLength >> 24) & 0xFF;
-				outgoingData[7] = (payloadLength >> 16) & 0xFF;
-				outgoingData[8] = (payloadLength >> 8) & 0xFF;
-				outgoingData[9] = payloadLength & 0xFF;
-			}
-
-			// more byte
-			outgoingData[payloadStartIndex] = (byte)(more ? 1 : 0);
-			payloadStartIndex++;
-
-			// payload
-			memcpy(outgoingData + payloadStartIndex, zframe_data(receivedFrame), zframe_size(receivedFrame));
-
-			address = zframe_dup(client->address);
-
-			zframe_send(&address, self->stream, ZFRAME_MORE);			
-			zsocket_sendmem(self->stream, outgoingData, frameSize, 0);
-
-			free(outgoingData);
-			zframe_destroy(&receivedFrame);
-
-			// TODO: check return code, on return code different than 0 or again set exception			
+			key = zlist_next(keys);
 		}
 	}
+	
+//		// send result
+//		uint8_t data = result;
+//		zsocket_sendmem(self->data, &data, 1, 0);
+	
 
 	free(hashkey);
 	zmsg_destroy(&request);
@@ -442,7 +568,7 @@ void s_agent_task(void *args, zctx_t *ctx, void *control)
 			break;              //  Interrupted
 
 		if (pollitems[0].revents & ZMQ_POLLIN)
-			s_agent_handle_control(self);
+			self->status = s_agent_handle_control(self);
 		if (pollitems[1].revents & ZMQ_POLLIN)
 			s_agent_handle_router(self);
 		if (pollitems[2].revents & ZMQ_POLLIN)
