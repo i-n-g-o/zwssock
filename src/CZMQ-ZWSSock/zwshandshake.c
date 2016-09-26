@@ -331,6 +331,10 @@ zframe_t* zwshandshake_get_response(zwshandshake_t *self)
 
 	char * key = zhash_lookup(self->header_fields, sec_websocket_key_name);
 
+	if (key == NULL) {
+		return zframe_new_empty();
+	}
+	
 	int len = strlen(key) + strlen(magic_string);
 
 	char plain[150];
